@@ -11,7 +11,6 @@ import {
 import type { Response } from 'express';
 import { GithubService } from './github.service';
 import { ParseCodeDto } from './dto/parse-code.dto';
-import { IngestRepoDto } from './dto/ingest-repo.dto';
 
 @Controller('github')
 export class GithubController {
@@ -172,15 +171,6 @@ export class GithubController {
   @Post('parse')
   async parseCode(@Body() dto: ParseCodeDto) {
     return this.githubService.parseCode(dto);
-  }
-
-  /**
-   * Repository Code-Aware Ingestion & Embedding endpoint
-   * POST /github/ingest
-   */
-  @Post('ingest')
-  async ingestRepository(@Body() dto: IngestRepoDto) {
-    return this.githubService.ingestRepository(dto);
   }
 
   /**

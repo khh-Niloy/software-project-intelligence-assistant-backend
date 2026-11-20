@@ -11,7 +11,6 @@ import {
   GithubCodeChunk,
   GithubCodeChunkSchema,
 } from './schemas/github-code-chunk.schema';
-import { DocumentModule } from '../document/document.module';
 
 @Module({
   imports: [
@@ -19,7 +18,6 @@ import { DocumentModule } from '../document/document.module';
       { name: GithubAccount.name, schema: GithubAccountSchema },
       { name: GithubCodeChunk.name, schema: GithubCodeChunkSchema },
     ]),
-    DocumentModule,
   ],
   controllers: [GithubController],
   providers: [GithubService, GithubToolsService],
