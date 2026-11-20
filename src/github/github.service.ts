@@ -4,6 +4,7 @@ import {
   InternalServerErrorException,
   Logger,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectModel } from '@nestjs/mongoose';
@@ -14,11 +15,18 @@ import {
   GithubAccountRecord,
 } from './schemas/github-account.schema';
 import {
+  GithubCodeChunk,
+  GithubCodeChunkRecord,
+} from './schemas/github-code-chunk.schema';
+import {
   FetchUserRepositoriesInput,
   FetchRepositoryTreeInput,
   FetchRepositoryFileInput,
 } from './tools/schema.tools';
 import { ParseCodeDto } from './dto/parse-code.dto';
+import { IngestRepoDto } from './dto/ingest-repo.dto';
+import { CodeChunker, CodeChunkItem } from './utils/code-chunker.util';
+import { DocumentService } from '../document/document.service';
 
 export interface GithubTokenResponse {
   access_token: string;
@@ -47,6 +55,11 @@ export class GithubService {
     @InjectModel(GithubAccount.name)
     private readonly githubAccountModel: Model<GithubAccountRecord>,
     private readonly configService: ConfigService,
+    @Optional()
+    @InjectModel(GithubCodeChunk.name)
+    private readonly githubCodeChunkModel?: Model<GithubCodeChunkRecord>,
+    @Optional()
+    private readonly documentService?: DocumentService,
   ) {}
 
   getAuthUrl(customState?: string): { url: string; state: string } {
@@ -265,6 +278,7 @@ export class GithubService {
     url.searchParams.set('visibility', visibility);
     url.searchParams.set('per_page', String(Math.min(per_page, 100)));
     url.searchParams.set('sort', sort);
+    url.searchParams.set('direction', sort === 'full_name' ? 'asc' : 'desc');
 
     this.logger.log(`Fetching user repositories: ${url.toString()}`);
     const res = await fetch(url.toString(), {
@@ -295,9 +309,12 @@ export class GithubService {
       stargazers_count: number;
       forks_count: number;
       open_issues_count: number;
+      created_at?: string;
       updated_at: string;
+      pushed_at?: string;
     }>;
-    return repos.map((repo) => ({
+
+    const mappedRepos = repos.map((repo) => ({
       name: repo.name,
       full_name: repo.full_name,
       private: repo.private,
@@ -309,8 +326,134 @@ export class GithubService {
       stargazers_count: repo.stargazers_count,
       forks_count: repo.forks_count,
       open_issues_count: repo.open_issues_count,
+      created_at: repo.created_at,
       updated_at: repo.updated_at,
+      pushed_at: repo.pushed_at,
     }));
+
+    // Sort most recent first
+    return mappedRepos.sort((a, b) => {
+      if (sort === 'full_name') {
+        return a.full_name.localeCompare(b.full_name);
+      }
+      if (sort === 'created') {
+        return (
+          new Date(b.created_at || b.updated_at || 0).getTime() -
+          new Date(a.created_at || a.updated_at || 0).getTime()
+        );
+      }
+      if (sort === 'pushed') {
+        return (
+          new Date(b.pushed_at || b.updated_at || 0).getTime() -
+          new Date(a.pushed_at || a.updated_at || 0).getTime()
+        );
+      }
+      const mostRecentA = Math.max(
+        new Date(a.pushed_at || 0).getTime(),
+        new Date(a.updated_at || 0).getTime(),
+        new Date(a.created_at || 0).getTime(),
+      );
+      const mostRecentB = Math.max(
+        new Date(b.pushed_at || 0).getTime(),
+        new Date(b.updated_at || 0).getTime(),
+        new Date(b.created_at || 0).getTime(),
+      );
+      return mostRecentB - mostRecentA;
+    });
+  }
+
+  /**
+   * Determines whether a file path from a repository tree should be included.
+   * - Include: .ts, .js, .md, .json
+   * - Exclude: node_modules, dist, .git, .env, lock files, binaries, generated files.
+   */
+  private shouldIncludeTreeFile(filePath: string): boolean {
+    const segments = filePath.split('/').filter(Boolean);
+    if (segments.length === 0) return false;
+
+    const fileName = segments[segments.length - 1];
+    const lowerFileName = fileName.toLowerCase();
+
+    // 1. Exclude restricted directories anywhere in path
+    const excludedDirs = new Set([
+      'node_modules',
+      'dist',
+      '.git',
+      'build',
+      '.next',
+      'out',
+      'coverage',
+      '.cache',
+      '.turbo',
+      'generated',
+      '__generated__',
+      'vendor',
+      '.prettierrc',
+      'eslint.config.mjs',
+      'nest-cli.json',
+      'tsconfig.build.json',
+    ]);
+    if (segments.some((seg) => excludedDirs.has(seg.toLowerCase()))) {
+      return false;
+    }
+
+    // 2. Exclude .env files
+    if (
+      lowerFileName === '.env' ||
+      lowerFileName.startsWith('.env.') ||
+      segments.some((seg) => seg.toLowerCase() === '.env')
+    ) {
+      return false;
+    }
+
+    // 3. Exclude lock files
+    const excludedLockFiles = new Set([
+      'package-lock.json',
+      'npm-shrinkwrap.json',
+      'yarn.lock',
+      'pnpm-lock.yaml',
+      'bun.lockb',
+      'bun.lock',
+      'composer.lock',
+      'cargo.lock',
+      'gemfile.lock',
+      'poetry.lock',
+    ]);
+    if (
+      excludedLockFiles.has(lowerFileName) ||
+      lowerFileName.endsWith('-lock.json') ||
+      lowerFileName.endsWith('.lock') ||
+      lowerFileName.endsWith('.lock.json')
+    ) {
+      return false;
+    }
+
+    // 4. Exclude generated files and binary artifacts
+    const excludedGeneratedSuffixes = [
+      '.min.js',
+      '.min.cjs',
+      '.bundle.js',
+      '.chunk.js',
+      '.d.ts',
+      '.d.ts.map',
+      '.js.map',
+      '.tsbuildinfo',
+      '.wasm',
+      '.bin',
+      '.exe',
+      '.dll',
+      '.so',
+      '.dylib',
+    ];
+    if (
+      excludedGeneratedSuffixes.some((suffix) => lowerFileName.endsWith(suffix))
+    ) {
+      return false;
+    }
+
+    // 5. Include only .ts, .js, .md, .json
+    const allowedExtensions = ['.ts', '.js', '.md', '.json'];
+    return allowedExtensions.some((ext) => lowerFileName.endsWith(ext));
   }
 
   /**
@@ -354,13 +497,37 @@ export class GithubService {
       }>;
     };
 
-    return {
-      owner,
-      repo,
-      branch,
-      truncated: Boolean(data.truncated),
-      total_items: data.tree?.length ?? 0,
-      tree: (data.tree || []).map((item) => ({
+    const rawTree = data.tree || [];
+
+    // Filter files to only allowed extensions & non-excluded paths
+    const filteredFiles = rawTree.filter(
+      (item) =>
+        (item.type === 'blob' || item.type === 'file') &&
+        this.shouldIncludeTreeFile(item.path),
+    );
+
+    // Collect ancestor directory paths for the included files
+    const activeDirectoryPaths = new Set<string>();
+    for (const file of filteredFiles) {
+      const parts = file.path.split('/');
+      let currentPath = '';
+      for (let i = 0; i < parts.length - 1; i++) {
+        currentPath = currentPath ? `${currentPath}/${parts[i]}` : parts[i];
+        activeDirectoryPaths.add(currentPath);
+      }
+    }
+
+    const filteredTree = rawTree
+      .filter((item) => {
+        if (item.type === 'blob' || item.type === 'file') {
+          return this.shouldIncludeTreeFile(item.path);
+        }
+        if (item.type === 'tree' || item.type === 'directory') {
+          return activeDirectoryPaths.has(item.path);
+        }
+        return false;
+      })
+      .map((item) => ({
         path: item.path,
         type:
           item.type === 'blob'
@@ -369,7 +536,15 @@ export class GithubService {
               ? 'directory'
               : item.type,
         size: item.size,
-      })),
+      }));
+
+    return {
+      owner,
+      repo,
+      branch,
+      truncated: Boolean(data.truncated),
+      total_items: filteredTree.length,
+      tree: filteredTree,
     };
   }
 
@@ -677,5 +852,222 @@ export class GithubService {
       imports,
       exports,
     };
+  }
+
+  /**
+   * Dedicated Repository Ingestion Pipeline:
+   * 1. Resolves owner, repoName, and branch
+   * 2. Fetches filtered file tree directly from GitHub Git Trees API
+   * 3. Fetches raw file contents directly from GitHub Contents API
+   * 4. Performs code-aware structural chunking (with line-aligned sub-chunking for oversized blocks)
+   * 5. Generates vector embeddings using LangChain Embeddings
+   * 6. Stores chunks in MongoDB matching { repoName, filePath, language, className, functionName, startLine, endLine, content, embedding }
+   */
+  async ingestRepository(dto: IngestRepoDto) {
+    if (!dto?.repoName || !dto.repoName.trim()) {
+      throw new BadRequestException('repoName is required');
+    }
+
+    const rawRepoInput = dto.repoName.trim();
+    const repoName = rawRepoInput.includes('/')
+      ? rawRepoInput.split('/').filter(Boolean).pop() || rawRepoInput
+      : rawRepoInput;
+
+    // Resolve owner from stored GitHub account in database
+    const account = await this.githubAccountModel
+      .findOne()
+      .sort({ updatedAt: -1 })
+      .lean()
+      .exec();
+
+    if (!account?.username) {
+      throw new BadRequestException(
+        'No connected GitHub account found in database. Please connect your GitHub account first.',
+      );
+    }
+
+    const owner = account.username;
+    const branch = 'main';
+    const headers = await this.getAuthHeaders();
+
+    // Step 1: Fetch repository tree directly from GitHub API
+    const treeUrl = `https://api.github.com/repos/${encodeURIComponent(
+      owner,
+    )}/${encodeURIComponent(repoName)}/git/trees/${encodeURIComponent(
+      branch,
+    )}?recursive=1`;
+
+    this.logger.log(
+      `[Ingest] Fetching repository tree from GitHub API: ${owner}/${repoName}@${branch}`,
+    );
+    const treeRes = await fetch(treeUrl, { headers });
+
+    if (!treeRes.ok) {
+      const errBody = await treeRes.text();
+      if (treeRes.status === 404) {
+        throw new NotFoundException(
+          `Repository or branch not found on GitHub: ${owner}/${repoName}@${branch}`,
+        );
+      }
+      throw new BadRequestException(
+        `Failed to fetch repository tree from GitHub API (HTTP ${treeRes.status}): ${errBody}`,
+      );
+    }
+
+    const treeData = (await treeRes.json()) as {
+      truncated?: boolean;
+      tree?: Array<{
+        path: string;
+        type: string;
+        size?: number;
+      }>;
+    };
+
+    const eligibleFiles = (treeData.tree || []).filter(
+      (item) =>
+        (item.type === 'blob' || item.type === 'file') &&
+        this.shouldIncludeTreeFile(item.path),
+    );
+
+    this.logger.log(
+      `[Ingest] Found ${eligibleFiles.length} eligible source files in ${owner}/${repoName}@${branch}`,
+    );
+
+    // Step 2: Fetch each file's content from GitHub API and run code-aware chunking
+    const allChunks: CodeChunkItem[] = [];
+    const batchSize = 5;
+
+    for (let i = 0; i < eligibleFiles.length; i += batchSize) {
+      const fileBatch = eligibleFiles.slice(i, i + batchSize);
+      const batchResults = await Promise.all(
+        fileBatch.map(async (fileItem) => {
+          const cleanPath = fileItem.path.replace(/^\/+/, '');
+          const contentUrl = `https://api.github.com/repos/${encodeURIComponent(
+            owner,
+          )}/${encodeURIComponent(
+            repoName,
+          )}/contents/${cleanPath}?ref=${encodeURIComponent(branch)}`;
+
+          const fileRes = await fetch(contentUrl, { headers });
+          if (!fileRes.ok) {
+            this.logger.warn(
+              `[Ingest] Skipping file "${cleanPath}" (HTTP ${fileRes.status})`,
+            );
+            return [];
+          }
+
+          const fileJson = (await fileRes.json()) as {
+            type?: string;
+            encoding?: string;
+            content?: string;
+          };
+
+          if (
+            fileJson.type !== 'file' ||
+            fileJson.encoding !== 'base64' ||
+            !fileJson.content
+          ) {
+            return [];
+          }
+
+          const rawText = Buffer.from(fileJson.content, 'base64').toString(
+            'utf-8',
+          );
+          if (!rawText.trim()) {
+            return [];
+          }
+
+          const language = CodeChunker.detectLanguage(cleanPath);
+          return CodeChunker.chunkFileContent({
+            repoName,
+            filePath: cleanPath,
+            language,
+            content: rawText,
+          });
+        }),
+      );
+
+      for (const fileChunks of batchResults) {
+        allChunks.push(...fileChunks);
+      }
+    }
+
+    this.logger.log(
+      `[Ingest] Generated ${allChunks.length} code-aware chunks across ${eligibleFiles.length} files`,
+    );
+
+    if (allChunks.length === 0) {
+      return {
+        repoName,
+        owner,
+        branch,
+        totalFiles: eligibleFiles.length,
+        totalChunks: 0,
+        chunks: [],
+      };
+    }
+
+    // Step 3: Generate vector embeddings using LangChain Embeddings in batches
+    if (!this.documentService) {
+      throw new InternalServerErrorException(
+        'DocumentService is not available for generating LangChain embeddings',
+      );
+    }
+
+    const embeddingBatchSize = 25;
+    const allEmbeddings: number[][] = [];
+
+    for (let i = 0; i < allChunks.length; i += embeddingBatchSize) {
+      const slice = allChunks.slice(i, i + embeddingBatchSize);
+      const textsToEmbed = slice.map((c) => c.content);
+      const batchVectors =
+        await this.documentService.generateEmbeddings(textsToEmbed);
+      allEmbeddings.push(...batchVectors);
+    }
+
+    const chunksWithEmbeddings = allChunks.map((chunk, idx) => ({
+      repoName: chunk.repoName,
+      filePath: chunk.filePath,
+      language: chunk.language,
+      className: chunk.className,
+      functionName: chunk.functionName,
+      startLine: chunk.startLine,
+      endLine: chunk.endLine,
+      content: chunk.content,
+      embedding: allEmbeddings[idx] ?? [],
+    }));
+
+    // Step 4: Persist to MongoDB
+    if (this.githubCodeChunkModel) {
+      await this.githubCodeChunkModel.deleteMany({ repoName });
+      await this.githubCodeChunkModel.insertMany(chunksWithEmbeddings);
+      this.logger.log(
+        `[Ingest] Stored ${chunksWithEmbeddings.length} embedded code chunks in MongoDB for repo "${repoName}"`,
+      );
+    }
+
+    return {
+      repoName,
+      owner,
+      branch,
+      totalFiles: eligibleFiles.length,
+      totalChunks: chunksWithEmbeddings.length,
+      chunks: chunksWithEmbeddings,
+    };
+  }
+
+  /**
+   * Retrieves stored code chunks from MongoDB for a given repository
+   */
+  async getIngestedChunks(repoName?: string) {
+    if (!this.githubCodeChunkModel) {
+      return [];
+    }
+    const filter = repoName ? { repoName: repoName.trim() } : {};
+    return this.githubCodeChunkModel
+      .find(filter)
+      .sort({ filePath: 1, startLine: 1 })
+      .lean()
+      .exec();
   }
 }

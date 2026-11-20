@@ -7,12 +7,19 @@ import {
   GithubAccount,
   GithubAccountSchema,
 } from './schemas/github-account.schema';
+import {
+  GithubCodeChunk,
+  GithubCodeChunkSchema,
+} from './schemas/github-code-chunk.schema';
+import { DocumentModule } from '../document/document.module';
 
 @Module({
   imports: [
     MongooseModule.forFeature([
       { name: GithubAccount.name, schema: GithubAccountSchema },
+      { name: GithubCodeChunk.name, schema: GithubCodeChunkSchema },
     ]),
+    DocumentModule,
   ],
   controllers: [GithubController],
   providers: [GithubService, GithubToolsService],
