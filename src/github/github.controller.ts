@@ -11,8 +11,9 @@ import {
 import type { Response } from 'express';
 import { GithubService } from './github.service';
 import { ParseCodeDto } from './dto/parse-code.dto';
+import { IngestRepoDto } from './dto/ingest-repo.dto';
 
-@Controller(['api/github', 'github'])
+@Controller('github')
 export class GithubController {
   private readonly logger = new Logger(GithubController.name);
 
@@ -20,8 +21,9 @@ export class GithubController {
 
   /**
    * Step 1: Redirects user to GitHub OAuth authorization screen
+   * GET /github/login
    */
-  @Get(['auth', 'login'])
+  @Get('login')
   authorize(@Query('state') state: string, @Res() res: Response) {
     const { url } = this.githubService.getAuthUrl(state);
     return res.redirect(url);
@@ -30,6 +32,7 @@ export class GithubController {
   /**
    * Step 2: GitHub redirects back with ?code=...
    * Exchanges code for token, saves account to MongoDB, and redirects back to frontend
+   * GET /github/callback
    */
   @Get('callback')
   async callback(
@@ -78,6 +81,7 @@ export class GithubController {
 
   /**
    * Status endpoint: check if GitHub account is currently connected
+   * GET /github/status
    */
   @Get('status')
   async getStatus() {
@@ -86,6 +90,7 @@ export class GithubController {
 
   /**
    * Disconnect endpoint: removes stored GitHub OAuth credentials
+   * POST /github/disconnect
    */
   @Post('disconnect')
   async disconnect() {
@@ -94,9 +99,9 @@ export class GithubController {
 
   /**
    * Repositories endpoint: fetch authenticated user's repositories
-   * GET /api/github/repos or /api/github/repositories
+   * GET /github/repos
    */
-  @Get(['repos', 'repositories'])
+  @Get('repos')
   async getRepos(
     @Query('visibility') visibility?: 'all' | 'public' | 'private',
     @Query('per_page') perPage?: string,
@@ -111,7 +116,7 @@ export class GithubController {
 
   /**
    * Repository Tree endpoint: fetch repository tree structure
-   * GET /api/github/tree
+   * GET /github/tree
    */
   @Get('tree')
   async getTree(
@@ -138,7 +143,7 @@ export class GithubController {
 
   /**
    * Repository Content endpoint: fetch file content or directory listing
-   * GET /api/github/content
+   * GET /github/content
    */
   @Get('content')
   async getContent(
@@ -162,10 +167,28 @@ export class GithubController {
 
   /**
    * Code Parsing endpoint using Tree-sitter
-   * POST /api/github/parse
+   * POST /github/parse
    */
-  @Post(['parse', 'parse-code'])
+  @Post('parse')
   async parseCode(@Body() dto: ParseCodeDto) {
     return this.githubService.parseCode(dto);
+  }
+
+  /**
+   * Repository Code-Aware Ingestion & Embedding endpoint
+   * POST /github/ingest
+   */
+  @Post('ingest')
+  async ingestRepository(@Body() dto: IngestRepoDto) {
+    return this.githubService.ingestRepository(dto);
+  }
+
+  /**
+   * Retrieve stored code chunks for a repository
+   * GET /github/chunks?repoName=...
+   */
+  @Get('chunks')
+  async getChunks(@Query('repoName') repoName?: string) {
+    return this.githubService.getIngestedChunks(repoName);
   }
 }
