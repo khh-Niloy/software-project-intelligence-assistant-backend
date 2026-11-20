@@ -2,6 +2,7 @@ import { NestFactory } from '@nestjs/core';
 import { Logger } from '@nestjs/common';
 import { AppModule } from '../src/app.module';
 import { GithubService } from '../src/github/github.service';
+import { IngestionService } from '../src/ingestion/ingestion.service';
 
 async function runSeedIngestion() {
   const logger = new Logger('SeedIngestion');
@@ -11,6 +12,7 @@ async function runSeedIngestion() {
 
   try {
     const githubService = app.get(GithubService);
+    const ingestionService = app.get(IngestionService);
 
     // 1. Fetch authenticated user's repositories (already sorted most recent first)
     logger.log('Fetching most recent repositories from GitHub...');
@@ -33,7 +35,7 @@ async function runSeedIngestion() {
         .join(', ')}`,
     );
 
-    // 2. Ingest each of the 3 most recent repositories sequentially
+    // 2. Ingest each of the 3 most recent repositories sequentially via IngestionService
     for (let i = 0; i < recentThreeRepos.length; i++) {
       const repo = recentThreeRepos[i];
       logger.log(
@@ -41,7 +43,7 @@ async function runSeedIngestion() {
       );
 
       try {
-        const result = await githubService.ingestRepository({
+        const result = await ingestionService.ingestRepository({
           repoName: repo.name,
         });
 

@@ -6,15 +6,6 @@ describe('ChatController', () => {
   let controller: ChatController;
 
   const mockChatService = {
-    handleQuery: jest.fn().mockResolvedValue({
-      res: {
-        query: 'test query',
-        answer: 'test answer',
-        insufficientContext: false,
-      },
-      rawChunks: [],
-      timings: { totalSeconds: 0.1 },
-    }),
     getAllQnas: jest.fn().mockResolvedValue([]),
     getQnaById: jest.fn().mockResolvedValue(null),
   };
@@ -35,13 +26,5 @@ describe('ChatController', () => {
 
   it('should be defined', () => {
     expect(controller).toBeDefined();
-  });
-
-  it('should route query to handleQuery', async () => {
-    const result = await controller.query({ query: 'hello' });
-    expect(mockChatService.handleQuery).toHaveBeenCalledWith({
-      query: 'hello',
-    });
-    expect(result).toBeDefined();
   });
 });

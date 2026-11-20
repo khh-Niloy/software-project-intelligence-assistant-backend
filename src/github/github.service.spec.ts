@@ -4,7 +4,6 @@ import { ConfigService } from '@nestjs/config';
 import { GithubService } from './github.service';
 import { GithubAccount } from './schemas/github-account.schema';
 import { GithubCodeChunk } from './schemas/github-code-chunk.schema';
-import { DocumentService } from '../document/document.service';
 
 describe('GithubService', () => {
   let service: GithubService;
@@ -16,17 +15,7 @@ describe('GithubService', () => {
   };
 
   const mockGithubCodeChunkModel = {
-    deleteMany: jest.fn().mockResolvedValue({ deletedCount: 0 }),
-    insertMany: jest.fn().mockImplementation((docs: unknown[]) => docs),
     find: jest.fn(),
-  };
-
-  const mockDocumentService = {
-    generateEmbeddings: jest
-      .fn()
-      .mockImplementation((texts: string[]) =>
-        Promise.resolve(texts.map(() => [0.12, 0.45, 0.67])),
-      ),
   };
 
   const mockConfigService = {
@@ -50,10 +39,6 @@ describe('GithubService', () => {
         {
           provide: getModelToken(GithubCodeChunk.name),
           useValue: mockGithubCodeChunkModel,
-        },
-        {
-          provide: DocumentService,
-          useValue: mockDocumentService,
         },
         {
           provide: ConfigService,
@@ -229,104 +214,6 @@ describe('GithubService', () => {
         'README.md',
         'package.json',
       ]);
-
-      fetchSpy.mockRestore();
-    });
-  });
-
-  describe('ingestRepository', () => {
-    it('should fetch tree and file contents via GitHub API, create code-aware chunks, embed with LangChain, and store in MongoDB', async () => {
-      mockGithubAccountModel.findOne.mockReturnValue({
-        sort: jest.fn().mockReturnValue({
-          lean: jest.fn().mockReturnValue({
-            exec: jest.fn().mockResolvedValue({
-              username: 'khh-Niloy',
-              accessToken: 'gho_token',
-            }),
-          }),
-        }),
-      });
-
-      const sampleAuthServiceCode = [
-        'export class AuthService {',
-        '  async login() {',
-        '    return { ok: true };',
-        '  }',
-        '}',
-      ].join('\n');
-
-      const fetchSpy = jest
-        .spyOn(global, 'fetch')
-        .mockImplementation((input: string | URL | Request) => {
-          const url =
-            typeof input === 'string'
-              ? input
-              : input instanceof URL
-                ? input.toString()
-                : input.url;
-          if (url.includes('/git/trees/')) {
-            return Promise.resolve({
-              ok: true,
-              status: 200,
-              json: () =>
-                Promise.resolve({
-                  truncated: false,
-                  tree: [
-                    {
-                      path: 'src/auth/auth.service.ts',
-                      type: 'blob',
-                      size: 80,
-                    },
-                    { path: 'package-lock.json', type: 'blob', size: 9000 },
-                  ],
-                }),
-            } as unknown as Response);
-          }
-          if (url.includes('/contents/src/auth/auth.service.ts')) {
-            return Promise.resolve({
-              ok: true,
-              status: 200,
-              json: () =>
-                Promise.resolve({
-                  type: 'file',
-                  encoding: 'base64',
-                  content: Buffer.from(sampleAuthServiceCode, 'utf-8').toString(
-                    'base64',
-                  ),
-                }),
-            } as unknown as Response);
-          }
-          return Promise.resolve({
-            ok: true,
-            status: 200,
-            json: () => Promise.resolve({ default_branch: 'main' }),
-          } as unknown as Response);
-        });
-
-      const result = await service.ingestRepository({
-        repoName: 'my-test-repo',
-      });
-
-      expect(result.repoName).toBe('my-test-repo');
-      expect(result.totalFiles).toBe(1);
-      expect(result.totalChunks).toBe(1);
-      expect(result.chunks[0]).toEqual({
-        repoName: 'my-test-repo',
-        filePath: 'src/auth/auth.service.ts',
-        language: 'typescript',
-        className: 'AuthService',
-        functionName: 'login',
-        startLine: 1,
-        endLine: 5,
-        content: sampleAuthServiceCode,
-        embedding: [0.12, 0.45, 0.67],
-      });
-      expect(mockGithubCodeChunkModel.deleteMany).toHaveBeenCalledWith({
-        repoName: 'my-test-repo',
-      });
-      expect(mockGithubCodeChunkModel.insertMany).toHaveBeenCalledWith(
-        result.chunks,
-      );
 
       fetchSpy.mockRestore();
     });

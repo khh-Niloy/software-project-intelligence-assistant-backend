@@ -24,9 +24,6 @@ import {
   FetchRepositoryFileInput,
 } from './tools/schema.tools';
 import { ParseCodeDto } from './dto/parse-code.dto';
-import { IngestRepoDto } from './dto/ingest-repo.dto';
-import { CodeChunker, CodeChunkItem } from './utils/code-chunker.util';
-import { DocumentService } from '../document/document.service';
 
 export interface GithubTokenResponse {
   access_token: string;
@@ -58,8 +55,6 @@ export class GithubService {
     @Optional()
     @InjectModel(GithubCodeChunk.name)
     private readonly githubCodeChunkModel?: Model<GithubCodeChunkRecord>,
-    @Optional()
-    private readonly documentService?: DocumentService,
   ) {}
 
   getAuthUrl(customState?: string): { url: string; state: string } {
@@ -332,7 +327,7 @@ export class GithubService {
     }));
 
     // Sort most recent first
-    return mappedRepos.sort((a, b) => {
+    const sortedRepos = mappedRepos.sort((a, b) => {
       if (sort === 'full_name') {
         return a.full_name.localeCompare(b.full_name);
       }
@@ -360,6 +355,22 @@ export class GithubService {
       );
       return mostRecentB - mostRecentA;
     });
+
+    const repoNames = sortedRepos.map((repo) => repo.name);
+    const ingestedRepoNames =
+      repoNames.length > 0 &&
+      this.githubCodeChunkModel &&
+      typeof this.githubCodeChunkModel.distinct === 'function'
+        ? await this.githubCodeChunkModel
+            .distinct('repoName', { repoName: { $in: repoNames } })
+            .exec()
+        : [];
+    const ingestedRepoNameSet = new Set(ingestedRepoNames);
+
+    return sortedRepos.map((repo) => ({
+      ...repo,
+      isIngested: ingestedRepoNameSet.has(repo.name),
+    }));
   }
 
   /**
@@ -851,208 +862,6 @@ export class GithubService {
       classes,
       imports,
       exports,
-    };
-  }
-
-  /**
-   * Dedicated Repository Ingestion Pipeline:
-   * 1. Resolves owner, repoName, and branch
-   * 2. Fetches filtered file tree directly from GitHub Git Trees API
-   * 3. Fetches raw file contents directly from GitHub Contents API
-   * 4. Performs code-aware structural chunking (with line-aligned sub-chunking for oversized blocks)
-   * 5. Generates vector embeddings using LangChain Embeddings
-   * 6. Stores chunks in MongoDB matching { repoName, filePath, language, className, functionName, startLine, endLine, content, embedding }
-   */
-  async ingestRepository(dto: IngestRepoDto) {
-    if (!dto?.repoName || !dto.repoName.trim()) {
-      throw new BadRequestException('repoName is required');
-    }
-
-    const rawRepoInput = dto.repoName.trim();
-    const repoName = rawRepoInput.includes('/')
-      ? rawRepoInput.split('/').filter(Boolean).pop() || rawRepoInput
-      : rawRepoInput;
-
-    // Resolve owner from stored GitHub account in database
-    const account = await this.githubAccountModel
-      .findOne()
-      .sort({ updatedAt: -1 })
-      .lean()
-      .exec();
-
-    if (!account?.username) {
-      throw new BadRequestException(
-        'No connected GitHub account found in database. Please connect your GitHub account first.',
-      );
-    }
-
-    const owner = account.username;
-    const branch = 'main';
-    const headers = await this.getAuthHeaders();
-
-    // Step 1: Fetch repository tree directly from GitHub API
-    const treeUrl = `https://api.github.com/repos/${encodeURIComponent(
-      owner,
-    )}/${encodeURIComponent(repoName)}/git/trees/${encodeURIComponent(
-      branch,
-    )}?recursive=1`;
-
-    this.logger.log(
-      `[Ingest] Fetching repository tree from GitHub API: ${owner}/${repoName}@${branch}`,
-    );
-    const treeRes = await fetch(treeUrl, { headers });
-
-    if (!treeRes.ok) {
-      const errBody = await treeRes.text();
-      if (treeRes.status === 404) {
-        throw new NotFoundException(
-          `Repository or branch not found on GitHub: ${owner}/${repoName}@${branch}`,
-        );
-      }
-      throw new BadRequestException(
-        `Failed to fetch repository tree from GitHub API (HTTP ${treeRes.status}): ${errBody}`,
-      );
-    }
-
-    const treeData = (await treeRes.json()) as {
-      truncated?: boolean;
-      tree?: Array<{
-        path: string;
-        type: string;
-        size?: number;
-      }>;
-    };
-
-    const eligibleFiles = (treeData.tree || []).filter(
-      (item) =>
-        (item.type === 'blob' || item.type === 'file') &&
-        this.shouldIncludeTreeFile(item.path),
-    );
-
-    this.logger.log(
-      `[Ingest] Found ${eligibleFiles.length} eligible source files in ${owner}/${repoName}@${branch}`,
-    );
-
-    // Step 2: Fetch each file's content from GitHub API and run code-aware chunking
-    const allChunks: CodeChunkItem[] = [];
-    const batchSize = 5;
-
-    for (let i = 0; i < eligibleFiles.length; i += batchSize) {
-      const fileBatch = eligibleFiles.slice(i, i + batchSize);
-      const batchResults = await Promise.all(
-        fileBatch.map(async (fileItem) => {
-          const cleanPath = fileItem.path.replace(/^\/+/, '');
-          const contentUrl = `https://api.github.com/repos/${encodeURIComponent(
-            owner,
-          )}/${encodeURIComponent(
-            repoName,
-          )}/contents/${cleanPath}?ref=${encodeURIComponent(branch)}`;
-
-          const fileRes = await fetch(contentUrl, { headers });
-          if (!fileRes.ok) {
-            this.logger.warn(
-              `[Ingest] Skipping file "${cleanPath}" (HTTP ${fileRes.status})`,
-            );
-            return [];
-          }
-
-          const fileJson = (await fileRes.json()) as {
-            type?: string;
-            encoding?: string;
-            content?: string;
-          };
-
-          if (
-            fileJson.type !== 'file' ||
-            fileJson.encoding !== 'base64' ||
-            !fileJson.content
-          ) {
-            return [];
-          }
-
-          const rawText = Buffer.from(fileJson.content, 'base64').toString(
-            'utf-8',
-          );
-          if (!rawText.trim()) {
-            return [];
-          }
-
-          const language = CodeChunker.detectLanguage(cleanPath);
-          return CodeChunker.chunkFileContent({
-            repoName,
-            filePath: cleanPath,
-            language,
-            content: rawText,
-          });
-        }),
-      );
-
-      for (const fileChunks of batchResults) {
-        allChunks.push(...fileChunks);
-      }
-    }
-
-    this.logger.log(
-      `[Ingest] Generated ${allChunks.length} code-aware chunks across ${eligibleFiles.length} files`,
-    );
-
-    if (allChunks.length === 0) {
-      return {
-        repoName,
-        owner,
-        branch,
-        totalFiles: eligibleFiles.length,
-        totalChunks: 0,
-        chunks: [],
-      };
-    }
-
-    // Step 3: Generate vector embeddings using LangChain Embeddings in batches
-    if (!this.documentService) {
-      throw new InternalServerErrorException(
-        'DocumentService is not available for generating LangChain embeddings',
-      );
-    }
-
-    const embeddingBatchSize = 25;
-    const allEmbeddings: number[][] = [];
-
-    for (let i = 0; i < allChunks.length; i += embeddingBatchSize) {
-      const slice = allChunks.slice(i, i + embeddingBatchSize);
-      const textsToEmbed = slice.map((c) => c.content);
-      const batchVectors =
-        await this.documentService.generateEmbeddings(textsToEmbed);
-      allEmbeddings.push(...batchVectors);
-    }
-
-    const chunksWithEmbeddings = allChunks.map((chunk, idx) => ({
-      repoName: chunk.repoName,
-      filePath: chunk.filePath,
-      language: chunk.language,
-      className: chunk.className,
-      functionName: chunk.functionName,
-      startLine: chunk.startLine,
-      endLine: chunk.endLine,
-      content: chunk.content,
-      embedding: allEmbeddings[idx] ?? [],
-    }));
-
-    // Step 4: Persist to MongoDB
-    if (this.githubCodeChunkModel) {
-      await this.githubCodeChunkModel.deleteMany({ repoName });
-      await this.githubCodeChunkModel.insertMany(chunksWithEmbeddings);
-      this.logger.log(
-        `[Ingest] Stored ${chunksWithEmbeddings.length} embedded code chunks in MongoDB for repo "${repoName}"`,
-      );
-    }
-
-    return {
-      repoName,
-      owner,
-      branch,
-      totalFiles: eligibleFiles.length,
-      totalChunks: chunksWithEmbeddings.length,
-      chunks: chunksWithEmbeddings,
     };
   }
 

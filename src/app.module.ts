@@ -6,6 +6,8 @@ import { DocumentModule } from './document/document.module';
 import { DatabaseModule } from './database/database.module';
 import { ChatModule } from './chat/chat.module';
 import { GithubModule } from './github/github.module';
+import { IngestionModule } from './ingestion/ingestion.module';
+import { RetrievalModule } from './retrieval/retrieval.module';
 import databaseConfig from './config/database.config';
 import supabaseConfig from './config/supabase.config';
 
@@ -19,6 +21,8 @@ import supabaseConfig from './config/supabase.config';
     DatabaseModule,
     ChatModule,
     GithubModule,
+    IngestionModule,
+    RetrievalModule,
   ],
   controllers: [AppController],
   providers: [AppService],
