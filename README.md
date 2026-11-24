@@ -44,6 +44,15 @@ $ npm run start:dev
 $ npm run start:prod
 ```
 
+## LLM configuration
+
+The answer generation provider is selected from `NODE_ENV`:
+
+- `NODE_ENV=development` uses local Ollama at `http://localhost:11434` with `qwen3:0.6b`. Install and start Ollama, then download the model with `ollama pull qwen3:0.6b`. A Gemini API key is not needed for answer generation in development.
+- `NODE_ENV=production` uses Google Gemini. Set `GOOGLE_API_KEY` or `GEMINI_API_KEY`; `PRIMARY_MODEL` optionally overrides the default `gemini-2.5-flash` model.
+
+The embedding configuration is separate and unchanged.
+
 ## Run tests
 
 ```bash

@@ -8,6 +8,7 @@ import { InjectModel } from '@nestjs/mongoose';
 import { cosineSimilarity } from '@langchain/core/utils/math';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
+import { ChatOllama } from '@langchain/ollama';
 import { Model, Types } from 'mongoose';
 import { Document, DocumentRecord } from '../document/schemas/document.schema';
 import {
@@ -190,7 +191,7 @@ export class RetrievalService {
     const { chunks, embeddingSeconds, vectorSearchSeconds } = retrieval;
     const insufficientContext =
       chunks.length === 0 || (chunks[0]?.score ?? 0) < 0.2;
-    const { answer, geminiSeconds } = await this.generateAnswer(
+    const { answer, llmSeconds } = await this.generateAnswer(
       query,
       chunks,
       sourceName,
@@ -199,7 +200,9 @@ export class RetrievalService {
     const timings = {
       embeddingSeconds,
       vectorSearchSeconds,
-      geminiSeconds,
+      llmSeconds,
+      /** @deprecated Use llmSeconds. Kept for existing API consumers. */
+      geminiSeconds: llmSeconds,
       totalSeconds: Number(
         ((performance.now() - totalStart) / 1000).toFixed(2),
       ),
@@ -236,24 +239,35 @@ export class RetrievalService {
     chunks: RetrievedChunk[],
     sourceName: string,
     isRepo: boolean,
-  ): Promise<{ answer: string; geminiSeconds: number }> {
+  ): Promise<{ answer: string; llmSeconds: number }> {
     const start = performance.now();
+    const isDevelopment = process.env.NODE_ENV === 'development';
+    const provider = isDevelopment ? 'Ollama' : 'Gemini';
     const apiKey = process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY;
-    if (!apiKey || chunks.length === 0) {
+    if ((!isDevelopment && !apiKey) || chunks.length === 0) {
       return {
         answer: chunks.length
           ? chunks.map((chunk) => chunk.text).join('\n\n')
           : `No relevant information found in ${isRepo ? 'the repository' : 'the document'} to answer this query.`,
-        geminiSeconds: Number(((performance.now() - start) / 1000).toFixed(2)),
+        llmSeconds: Number(((performance.now() - start) / 1000).toFixed(2)),
       };
     }
 
     try {
-      const chat = new ChatGoogleGenerativeAI({
-        apiKey,
-        model: process.env.PRIMARY_MODEL ?? 'gemini-2.5-flash',
-        temperature: 0.2,
-      });
+      this.logger.log(
+        `Generating answer with ${isDevelopment ? 'Ollama qwen3:0.6b' : `Gemini ${process.env.PRIMARY_MODEL ?? 'gemini-2.5-flash'}`}.`,
+      );
+      const chat = isDevelopment
+        ? new ChatOllama({
+            model: 'qwen3:0.6b',
+            baseUrl: 'http://localhost:11434',
+            temperature: 0.2,
+          })
+        : new ChatGoogleGenerativeAI({
+            apiKey,
+            model: process.env.PRIMARY_MODEL ?? 'gemini-2.5-flash',
+            temperature: 0.2,
+          });
       const context = chunks
         .map((chunk, index) => {
           const metadata = chunk.metadata;
@@ -290,15 +304,21 @@ export class RetrievalService {
           typeof response.content === 'string'
             ? response.content
             : JSON.stringify(response.content),
-        geminiSeconds: Number(((performance.now() - start) / 1000).toFixed(2)),
+        llmSeconds: Number(((performance.now() - start) / 1000).toFixed(2)),
       };
     } catch (error) {
       this.logger.warn(
-        `Gemini answer generation failed: ${error instanceof Error ? error.message : String(error)}`,
+        `${provider} answer generation failed: ${error instanceof Error ? error.message : String(error)}`,
       );
+      if (isDevelopment) {
+        throw new Error(
+          `Ollama answer generation failed: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        );
+      }
       return {
         answer: chunks[0]?.text ?? 'No response generated.',
-        geminiSeconds: Number(((performance.now() - start) / 1000).toFixed(2)),
+        llmSeconds: Number(((performance.now() - start) / 1000).toFixed(2)),
       };
     }
   }

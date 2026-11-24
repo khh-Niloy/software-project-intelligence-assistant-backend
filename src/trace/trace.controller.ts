@@ -1,5 +1,6 @@
 import {
   Body,
+  Delete,
   Controller,
   Get,
   Param,
@@ -47,11 +48,23 @@ export class TraceController {
     return this.traceService.getAllProjects();
   }
 
+  /** Delete a project and its associated requirements by project ID. */
+  @Delete('projects/:id')
+  async deleteProject(@Param('id') id: string) {
+    return this.traceService.deleteProject(id);
+  }
+
   /**
    * Get all requirement documents for a specific repository by repoName
    */
   @Get('requirements/:repoName')
   async getRequirementsByRepoName(@Param('repoName') repoName: string) {
     return this.traceService.getRequirementsByRepoName(repoName);
+  }
+
+  /** Delete one requirement by requirement ID. */
+  @Delete('requirements/:id')
+  async deleteRequirement(@Param('id') id: string) {
+    return this.traceService.deleteRequirement(id);
   }
 }
