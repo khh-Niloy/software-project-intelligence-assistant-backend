@@ -1,5 +1,6 @@
 import { NestFactory } from '@nestjs/core';
 import { Logger } from '@nestjs/common';
+import cookieParser from 'cookie-parser';
 import { AppModule } from './app.module';
 import {
   TransformInterceptor,
@@ -11,6 +12,9 @@ import { HttpExceptionFilter } from './common/filters';
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   const logger = new Logger('Bootstrap');
+
+  // Parse cookies from incoming requests
+  app.use(cookieParser());
 
   // Configure CORS
   const allowedOrigins = process.env.CORS_ORIGIN
