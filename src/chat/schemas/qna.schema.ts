@@ -27,6 +27,8 @@ export class Qna {
   timings: {
     embeddingSeconds: number;
     vectorSearchSeconds: number;
+    llmSeconds: number;
+    /** @deprecated Use llmSeconds. Kept for existing API consumers. */
     geminiSeconds: number;
     totalSeconds: number;
   };

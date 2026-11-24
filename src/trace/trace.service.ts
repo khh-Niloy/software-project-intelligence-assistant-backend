@@ -9,6 +9,7 @@ import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
 import { cosineSimilarity } from '@langchain/core/utils/math';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
+import { ChatOllama } from '@langchain/ollama';
 import { Project, ProjectRecord } from './schemas/project.schema';
 import {
   Requirement,
@@ -94,7 +95,9 @@ export class TraceService {
 
       const doc = await this.documentModel.findById(documentId).exec();
       if (!doc) {
-        throw new NotFoundException(`Document with ID "${documentId}" not found`);
+        throw new NotFoundException(
+          `Document with ID "${documentId}" not found`,
+        );
       }
       documentName = doc.filename;
 
@@ -148,17 +151,23 @@ export class TraceService {
    */
   async approveRequirements(dto: ApproveTraceDto) {
     if (!dto.repoName || !dto.repoName.trim()) {
-      throw new BadRequestException('A target repository name must be selected.');
+      throw new BadRequestException(
+        'A target repository name must be selected.',
+      );
     }
 
     const repoName = dto.repoName.trim();
 
     if (!dto.requirements || dto.requirements.length === 0) {
-      throw new BadRequestException('At least one requirement must be approved.');
+      throw new BadRequestException(
+        'At least one requirement must be approved.',
+      );
     }
 
     // Check if project for this repository has already been added
-    const existingProject = await this.projectModel.findOne({ repoName }).exec();
+    const existingProject = await this.projectModel
+      .findOne({ repoName })
+      .exec();
     if (existingProject) {
       throw new BadRequestException(
         `A traceability project for repository "${repoName}" has already been approved and added.`,
@@ -302,6 +311,48 @@ export class TraceService {
     );
   }
 
+  /** Delete a project and every requirement associated with its repository. */
+  async deleteProject(id: string) {
+    if (!Types.ObjectId.isValid(id)) {
+      throw new BadRequestException(`Invalid project ID: ${id}`);
+    }
+
+    const project = await this.projectModel.findById(id).exec();
+    if (!project) {
+      throw new NotFoundException(`Project with ID "${id}" not found`);
+    }
+
+    const deletedRequirements = await this.requirementModel.deleteMany({
+      'repository.name': project.repoName,
+    });
+    await this.projectModel.deleteOne({ _id: project._id }).exec();
+
+    return {
+      message: `Project "${project.repoName}" and its requirements were deleted.`,
+      deletedProjectId: project._id,
+      deletedRequirements: deletedRequirements.deletedCount ?? 0,
+    };
+  }
+
+  /** Delete one requirement by its MongoDB ID. */
+  async deleteRequirement(id: string) {
+    if (!Types.ObjectId.isValid(id)) {
+      throw new BadRequestException(`Invalid requirement ID: ${id}`);
+    }
+
+    const requirement = await this.requirementModel
+      .findByIdAndDelete(id)
+      .exec();
+    if (!requirement) {
+      throw new NotFoundException(`Requirement with ID "${id}" not found`);
+    }
+
+    return {
+      message: `Requirement "${requirement.requirementSlug}" was deleted.`,
+      deletedRequirementId: requirement._id,
+    };
+  }
+
   /**
    * Get all requirement documents by repoName
    */
@@ -326,9 +377,7 @@ export class TraceService {
     chunks: GithubCodeChunkRecord[],
   ): Promise<{
     implementationStatus:
-      | 'completed'
-      | 'partially_implemented'
-      | 'not_implemented';
+      'completed' | 'partially_implemented' | 'not_implemented';
     evidence: EvidenceItem[];
   }> {
     const validChunks = chunks.filter(
@@ -378,8 +427,10 @@ export class TraceService {
     }
 
     // Call LLM to confirm implementation and explain evidence
+    const isDevelopment = process.env.NODE_ENV === 'development';
+    const provider = isDevelopment ? 'Ollama' : 'Gemini';
     const apiKey = process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY;
-    if (!apiKey) {
+    if (!isDevelopment && !apiKey) {
       const best = topCandidates[0];
       return {
         implementationStatus:
@@ -397,11 +448,20 @@ export class TraceService {
     }
 
     try {
-      const chat = new ChatGoogleGenerativeAI({
-        apiKey,
-        model: process.env.PRIMARY_MODEL ?? 'gemini-2.5-flash',
-        temperature: 0.1,
-      });
+      this.logger.log(
+        `Evaluating requirement with ${isDevelopment ? 'Ollama qwen3:0.6b' : `Gemini ${process.env.PRIMARY_MODEL ?? 'gemini-2.5-flash'}`}.`,
+      );
+      const chat = isDevelopment
+        ? new ChatOllama({
+            model: 'qwen3:0.6b',
+            baseUrl: 'http://localhost:11434',
+            temperature: 0.1,
+          })
+        : new ChatGoogleGenerativeAI({
+            apiKey,
+            model: process.env.PRIMARY_MODEL ?? 'gemini-2.5-flash',
+            temperature: 0.1,
+          });
 
       const snippetsText = topCandidates
         .map(
@@ -499,7 +559,7 @@ Return ONLY a valid JSON object matching this schema without markdown code block
       };
     } catch (err) {
       this.logger.error(
-        `LLM evaluation failed for requirement "${title}": ${err}`,
+        `${provider} evaluation failed for requirement "${title}": ${err}`,
       );
       const best = topCandidates[0];
       return {
@@ -522,6 +582,8 @@ Return ONLY a valid JSON object matching this schema without markdown code block
     text: string,
     documentName: string,
   ): Promise<ExtractedRequirement[]> {
+    const isDevelopment = process.env.NODE_ENV === 'development';
+    const provider = isDevelopment ? 'Ollama' : 'Gemini';
     const apiKey = process.env.GOOGLE_API_KEY ?? process.env.GEMINI_API_KEY;
     const truncatedText = text.slice(0, 55000);
 
@@ -548,19 +610,21 @@ You MUST respond ONLY with a valid JSON array of objects. Do NOT include markdow
   }
 ]`;
 
-    if (!apiKey) {
-      this.logger.warn(
-        'GEMINI_API_KEY / GOOGLE_API_KEY not configured. Generating fallback baseline requirements.',
-      );
-      return this.generateFallbackRequirements(text, documentName);
-    }
-
     try {
-      const model = new ChatGoogleGenerativeAI({
-        apiKey,
-        model: process.env.PRIMARY_MODEL ?? 'gemini-2.5-flash',
-        temperature: 0.1,
-      });
+      this.logger.log(
+        `Extracting requirements with ${isDevelopment ? 'Ollama qwen3:0.6b' : `Gemini ${process.env.PRIMARY_MODEL ?? 'gemini-2.5-flash'}`}.`,
+      );
+      const model = isDevelopment
+        ? new ChatOllama({
+            model: 'qwen3:0.6b',
+            baseUrl: 'http://localhost:11434',
+            temperature: 0.1,
+          })
+        : new ChatGoogleGenerativeAI({
+            apiKey,
+            model: process.env.PRIMARY_MODEL ?? 'gemini-2.5-flash',
+            temperature: 0.1,
+          });
 
       const response = await model.invoke(prompt);
       let content =
@@ -587,45 +651,47 @@ You MUST respond ONLY with a valid JSON array of objects. Do NOT include markdow
       }));
     } catch (err) {
       this.logger.error(
-        `Failed to parse LLM requirements response: ${err instanceof Error ? err.message : String(err)}`,
+        `${provider} requirements extraction failed: ${err instanceof Error ? err.message : String(err)}`,
       );
-      return this.generateFallbackRequirements(text, documentName);
+      throw new InternalServerErrorException(
+        `${provider} requirements extraction failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }
 
-  private generateFallbackRequirements(
-    text: string,
-    documentName: string,
-  ): ExtractedRequirement[] {
-    const lines = text
-      .split('\n')
-      .map((l) => l.trim())
-      .filter((l) => l.length > 20 && !l.startsWith('#'));
+  // private generateFallbackRequirements(
+  //   text: string,
+  //   documentName: string,
+  // ): ExtractedRequirement[] {
+  //   const lines = text
+  //     .split('\n')
+  //     .map((l) => l.trim())
+  //     .filter((l) => l.length > 20 && !l.startsWith('#'));
 
-    const items: ExtractedRequirement[] = [];
-    const limit = Math.min(lines.length, 6);
+  //   const items: ExtractedRequirement[] = [];
+  //   const limit = Math.min(lines.length, 6);
 
-    for (let i = 0; i < limit; i++) {
-      const line = lines[i];
-      const title =
-        line.length > 60 ? `${line.substring(0, 57)}...` : line;
-      items.push({
-        id: `REQ-${String(i + 1).padStart(2, '0')}`,
-        title: `Requirement: ${title}`,
-        description: line,
-        status: 'accepted',
-      });
-    }
+  //   for (let i = 0; i < limit; i++) {
+  //     const line = lines[i];
+  //     const title =
+  //       line.length > 60 ? `${line.substring(0, 57)}...` : line;
+  //     items.push({
+  //       id: `REQ-${String(i + 1).padStart(2, '0')}`,
+  //       title: `Requirement: ${title}`,
+  //       description: line,
+  //       status: 'accepted',
+  //     });
+  //   }
 
-    if (items.length === 0) {
-      items.push({
-        id: 'REQ-01',
-        title: 'Core System Functionality',
-        description: `Implement primary software capabilities as specified in ${documentName}.`,
-        status: 'accepted',
-      });
-    }
+  //   if (items.length === 0) {
+  //     items.push({
+  //       id: 'REQ-01',
+  //       title: 'Core System Functionality',
+  //       description: `Implement primary software capabilities as specified in ${documentName}.`,
+  //       status: 'accepted',
+  //     });
+  //   }
 
-    return items;
-  }
+  //   return items;
+  // }
 }
